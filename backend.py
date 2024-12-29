@@ -97,8 +97,8 @@ def pipeline(session_id, rollcall_ids):
         add_rollcall_votes(rid, votes)
     create_spreadsheet(session_id, rollcall_ids)
 #%%
-drop_tables()
-create_tables()
+# drop_tables()
+# create_tables()
 #%%
 add_session_people(example_session_id, fetch_people(example_session_id))
 add_rollcall_votes(example_roll_call_id, fetch_votes(example_roll_call_id))
