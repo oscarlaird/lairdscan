@@ -94,8 +94,15 @@ payload = {
 }
 
 # Send the request
-response = requests.post(url, headers=headers, json=payload)
+def fetch_ratings(state, year):
+    payload['variables']['from']=state
+    payload['variables']['year']=year
+    response = requests.post(url, headers=headers, json=payload)
+    data = response.json()
+    return data['data']['ratings_people']
+
+# print(fetch_ratings('NC', 2023))
 
 # Log the response
-print("Status Code:", response.status_code)
-print("Response Text:", response.text)
+#print("Status Code:", response.status_code)
+#print("Response Text:", response.text)
