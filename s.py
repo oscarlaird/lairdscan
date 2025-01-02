@@ -2,13 +2,12 @@
 import sqlite3
 import requests
 import pandas as pd
-
-#%%
 from cpac_scanner import fetch_ratings
-#%%
+import base64
+import json
 
 # Create/connect to database
-conn = sqlite3.connect('legislative_data.db')
+conn = sqlite3.connect(':memory:')
 cursor = conn.cursor()
 
 #%%
@@ -54,7 +53,8 @@ def create_tables():
         name TEXT NOT NULL,
         last_name TEXT NOT NULL,
         role TEXT NOT NULL,
-        party TEXT
+        party TEXT,
+        UNIQUE(state, name)
     )''')
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS rollcall_votes (
@@ -80,11 +80,9 @@ def add_session_people(state, people_data, house_or_senate):
             continue
         if house_or_senate=='senate':
             if p['role']=='Rep':
-                print("Skipping Rep in session people")
                 continue
         if house_or_senate=='house':
             if p['role']=='Sen':
-                print("Skipping Sen in session people")
                 continue
         cursor.execute('''
         INSERT OR IGNORE INTO session_people (state, people_id, name, last_name, role, party)
@@ -105,11 +103,9 @@ def add_cpac_people(state, year, cpac_people_data, house_or_senate):
         years_of_service=c['yearsRated']['aggregate']['count']
         if house_or_senate=='senate':
             if c['history'][0]['chamber']=='house':
-                print("Skipping Rep in cpac data")
                 continue
         if house_or_senate=='house':
             if c['history'][0]['chamber']=='senate':
-                print("Skipping Sen in cpac data")
                 continue
         cursor.execute('''
         INSERT OR IGNORE INTO cpac_people (name, party, previous_year_score, old_lifetime_score, years_of_service, state, year)
@@ -154,158 +150,161 @@ def create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year):
     df = pd.merge(df, cpac_df, left_on='Name', right_on='cpac_name', how='outer')
     sorted_df = df.sort_values(by='last_name', ascending=True)
     # Write to Excel
-    sorted_df.to_excel(f'votes_{state}.xlsx', index=False)
+    file_name = f'votes_{state}_{year}.xlsx'
+    sorted_df.to_excel(file_name, index=False)
+    return file_name
 
 
-#%%
-import tkinter as tk
-root = tk.Tk()
-root.title("Roll Call Scraper")
-root.geometry("600x600")
-# allow resizing
-root.grid_columnconfigure(0, weight=1)
-root.grid_rowconfigure(0, weight=1)
-# Create a main frame
-main_frame = tk.Frame(root)
-main_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
-# Add a label for showing messages
-msg_label = tk.Label(main_frame, text="Enter links to roll calls from the legiscan website.")
-msg_label.pack(pady=10)
-# state entry field
-# Create state entry frame and widgets
-state_frame = tk.Frame(main_frame)
-state_frame.pack(pady=5)
-state_label = tk.Label(state_frame, text="STATE")
-state_label.pack(side=tk.LEFT, padx=5)
-state_entry = tk.Entry(state_frame, width=100)
-default_state_entry_msg = "AZ"
-state_entry.insert(0, default_state_entry_msg)
-state_entry.pack(side=tk.LEFT, padx=5)
-# year entry field
-year_frame = tk.Frame(main_frame)
-year_frame.pack(pady=5)
-year_label = tk.Label(year_frame, text="YEAR")
-year_label.pack(side=tk.LEFT, padx=5)
-year_entry = tk.Entry(year_frame, width=100)
-default_year_entry_msg = "2023"
-year_entry.insert(0, default_year_entry_msg)
-year_entry.pack(side=tk.LEFT, padx=5)
-# Add toggle for house/senate
-house_or_senate_toggle_flag = tk.IntVar(value=0)
-toggle_frame = tk.Frame(main_frame)
-toggle_frame.pack(pady=5)
-radio_off = tk.Radiobutton(toggle_frame, text="Senate", variable=house_or_senate_toggle_flag, value=0, indicatoron=False, width=10)
-radio_on = tk.Radiobutton(toggle_frame, text="House", variable=house_or_senate_toggle_flag, value=1, indicatoron=False, width=10)
-radio_off.pack(side=tk.LEFT, padx=5)
-radio_on.pack(side=tk.LEFT, padx=5)
-# rollCallId entry fields
-good_rollcalls_label = tk.Label(main_frame, text="Good Roll Call URLs (one per line)")
-good_rollcalls_label.pack(pady=(10,0))
-good_rollcalls_entry = tk.Text(main_frame, width=1000, height=5)
-default_good_roll_call_entry_msg = """
-https://legiscan.com/AZ/rollcall/SB1003/id/1373207
-https://legiscan.com/AZ/rollcall/SB1004/id/1398904
-"""
-good_rollcalls_entry.insert("1.0", default_good_roll_call_entry_msg)
-good_rollcalls_entry.pack(pady=5, fill="both", expand=True)
-
-bad_rollcalls_label = tk.Label(main_frame, text="Bad Roll Call URLs (one per line)")
-bad_rollcalls_label.pack(pady=(10,0))
-bad_rollcalls_entry = tk.Text(main_frame, width=1000, height=5)
-bad_rollcalls_entry.insert("1.0", "")
-bad_rollcalls_entry.pack(pady=5, fill="both", expand=True)
-
-def validate_session_id():
+def validate_year(year: str):
     try:
-        session_ids = [int(line) for line in session_entry.get("1.0", tk.END).splitlines()]
-        return session_ids
-    except ValueError:
-        return False
-def validate_year():
-    try:
-        year = int(year_entry.get())
+        year = int(year)
         return year
     except ValueError:
         return False 
-def validate_state():
+def validate_state(state: str):
     try:
-        state = state_entry.get()
         assert len(state)==2
         return state
     except AssertionError:
         return False     
-def validate_rollcalls(entry_widget):
+def validate_rollcalls(rollcalls: str):
     try:
-        urls = [line.strip() for line in entry_widget.get("1.0", tk.END).splitlines()]
+        urls = [line.strip() for line in rollcalls.splitlines()]
         rollCallIds = [int(url.split("id/")[-1]) for url in urls if url]
         return rollCallIds
     except ValueError as e:
         print(f"Error validating roll calls: {e}")
         return False
-def process():
+async def process(state: str, year: str, chamber: str, good_rollcalls: str, bad_rollcalls: str, websocket: WebSocket, manager):
     # session_ids = validate_session_id()
     # if not session_ids:
     #     msg_button.config(text="Please enter a valid session ID")
     #     session_entry.delete(0, tk.END)
     #     session_entry.insert(0, default_session_entry_msg)
     #     return
-    good_rollcall_ids = validate_rollcalls(good_rollcalls_entry)
-    bad_rollcall_ids = validate_rollcalls(bad_rollcalls_entry)
-    if good_rollcall_ids is False or bad_rollcall_ids is False:
-        msg_label.config(text="Please enter urls which end in the roll call id.")
-        return
-    year = validate_year()
-    if not year:
-        msg_label.config(text="Please enter a valid year")
-        return
-    state = validate_state()
-    if not state: 
-        msg_label.config(text="Please enter a two letter state abbreviation")
-        return
-    msg_label.config(text=f"Fetching sessions list for {state} in {year}...")
-    root.update()
+    await manager.send_message("Processing...", websocket)
+    good_rollcall_ids = validate_rollcalls(good_rollcalls)
+    bad_rollcall_ids = validate_rollcalls(bad_rollcalls)
+    year = validate_year(year)
+    state = validate_state(state)
     session_ids = fetch_sessions_list(state, year)
     drop_tables()
     create_tables()
-    msg_label.config(text="Fetching session people...")
-    root.update()
+    house_or_senate_flag = 0 if chamber=="senate" else 1
     for session_id in session_ids:
         session_people = fetch_people(session_id)
-        house_or_senate = "senate" if house_or_senate_toggle_flag.get()==0 else "house"
+        house_or_senate = "senate" if house_or_senate_flag==0 else "house"
         add_session_people(state, session_people, house_or_senate)
+        await manager.send_message(f"Processed session {session_id}", websocket)
 
     for rid in good_rollcall_ids+bad_rollcall_ids:
-        msg_label.config(text=f"Fetching votes for roll call {rid}...")
-        root.update()
+        await manager.send_message(f"Processing roll call {rid}...", websocket)
+        print(f"Fetching votes for roll call {rid}...")
         votes = fetch_votes(rid)
         add_rollcall_votes(rid, votes)
 
-    msg_label.config(text="Fetching CPAC (acu) Ratings...")
-    root.update()
+    print("Fetching CPAC (acu) Ratings...")
+    await manager.send_message("Fetching CPAC (acu) Ratings...", websocket)
     data = fetch_ratings(state, year)
     add_cpac_people(state, year, data, house_or_senate)
 
-    msg_label.config(text="Creating spreadsheet...")
-    root.update()
-    create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year)
-    msg_label.config(text="Spreadsheet created!")
-# Add a button
-button = tk.Button(main_frame, text="Create Spreadsheet!", command=process)
-button.pack(pady=10)
-# Start the main loop
-# root.mainloop()
+    print("Creating spreadsheet...")
+    await manager.send_message("Creating spreadsheet...", websocket)
+    file_name = create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year)
+    print("Spreadsheet created!")
+    await manager.send_message("Spreadsheet created!", websocket)
+    return file_name
 
 
 #%%
-# default_roll_call_entry_msg = "1253853\n1353336"
-# drop_tables()
-# create_tables()
-# data = fetch_votes(1253853)
-# print(data, len(data), type(data))
-# add_rollcall_votes(1253853, data)
+import nest_asyncio
+nest_asyncio.apply()
+from fastapi import FastAPI
+import uvicorn
+from pydantic import BaseModel
+from typing import Dict, Any
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+import os
+from fastapi import WebSocket
+from fastapi import WebSocket
+from typing import List
 
+# Add these new variables
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    async def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def send_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+
+manager = ConnectionManager()
+
+class RollCallData(BaseModel):
+    state: str
+    year: str
+    chamber: str
+    goodRollCalls: str
+    badRollCalls: str
+
+app = FastAPI()
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            try:
+                # Process the data and get the file path
+                file_name = await process(
+                    data["state"], 
+                    data["year"], 
+                    data["chamber"], 
+                    data["goodRollCalls"], 
+                    data["badRollCalls"],
+                    websocket,
+                    manager
+                )
+                
+                # Read the file and send it as base64
+                with open(file_name, 'rb') as file:
+                    file_bytes = file.read()
+                    base64_bytes = base64.b64encode(file_bytes).decode('utf-8')
+                    await manager.send_message(json.dumps({
+                        "type": "file",
+                        "data": base64_bytes,
+                        "filename": file_name
+                    }), websocket)
+                
+                # Clean up the file
+                os.remove(file_name)
+                
+            except Exception as e:
+                await manager.send_message(json.dumps({
+                    "type": "error",
+                    "message": str(e)
+                }), websocket)
+    except:
+        await manager.disconnect(websocket)
+
+if __name__ == '__main__':
+    uvicorn.run(app, host="0.0.0.0", port=5000)
 
 # %%
-conn.commit()
-cursor.close()
-conn.close()
