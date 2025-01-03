@@ -1,4 +1,5 @@
 #%%
+# python3 -m pip install pandas nest_asyncio pandas fastapi uvicorn[standard] openpyxl --break-system-packages
 import sqlite3
 import requests
 import pandas as pd
@@ -122,6 +123,18 @@ def create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year):
     cursor.execute(query, [state])
     df = pd.DataFrame(cursor.fetchall(), columns=['Name', 'last_name', 'role', 'party'])
 
+    #Get cpac ratings
+    query = """
+    SELECT name AS cpac_name, party AS cpac_party, previous_year_score, old_lifetime_score, years_of_service
+    FROM cpac_people
+    WHERE state = ? AND year = ?
+    """
+    cpac_year = year - 1
+    cursor.execute(query, [state, cpac_year])
+    cpac_df = pd.DataFrame(cursor.fetchall(), columns=['cpac_name', 'cpac_party', 'previous_year_score', 'old_lifetime_score', 'years_of_service'])
+    df = pd.merge(df, cpac_df, left_on='Name', right_on='cpac_name', how='outer')
+    df = df.sort_values(by='last_name', ascending=True)
+
     # Add each bill's votes as a new column
     for i, rollcall_id in enumerate(good_rollcall_ids + bad_rollcall_ids):
         query = """
@@ -137,21 +150,11 @@ def create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year):
         df = df.merge(votes[['Name', f'Bill{i+1}']], on='Name', how='left')
         # Add score column based on vote text
         vote_text_map = {'Yea': '+', 'Nay': '-', 'NV': 'x'} if rollcall_id in good_rollcall_ids else {'Yea': '-', 'Nay': '+', 'NV': 'x'}
-        df[f'Bill{i+1}_score'] = df[f'Bill{i+1}'].map(vote_text_map)
+        df[f'Bill{i+1}'] = df[f'Bill{i+1}'].map(vote_text_map)
 
-    #Get cpac ratings
-    query = """
-    SELECT name AS cpac_name, party AS cpac_party, previous_year_score, old_lifetime_score, years_of_service
-    FROM cpac_people
-    WHERE state = ? AND year = ?
-    """
-    cursor.execute(query, [state, year])
-    cpac_df = pd.DataFrame(cursor.fetchall(), columns=['cpac_name', 'cpac_party', 'previous_year_score', 'old_lifetime_score', 'years_of_service'])
-    df = pd.merge(df, cpac_df, left_on='Name', right_on='cpac_name', how='outer')
-    sorted_df = df.sort_values(by='last_name', ascending=True)
     # Write to Excel
     file_name = f'votes_{state}_{year}.xlsx'
-    sorted_df.to_excel(file_name, index=False)
+    df.to_excel(file_name, index=False)
     return file_name
 
 
@@ -175,7 +178,7 @@ def validate_rollcalls(rollcalls: str):
     except ValueError as e:
         print(f"Error validating roll calls: {e}")
         return False
-async def process(state: str, year: str, chamber: str, good_rollcalls: str, bad_rollcalls: str, websocket: WebSocket, manager):
+async def process(state: str, year: str, chamber: str, good_rollcalls: str, bad_rollcalls: str, websocket, manager):
     # session_ids = validate_session_id()
     # if not session_ids:
     #     msg_button.config(text="Please enter a valid session ID")
@@ -205,8 +208,9 @@ async def process(state: str, year: str, chamber: str, good_rollcalls: str, bad_
 
     print("Fetching CPAC (acu) Ratings...")
     await manager.send_message("Fetching CPAC (acu) Ratings...", websocket)
-    data = fetch_ratings(state, year)
-    add_cpac_people(state, year, data, house_or_senate)
+    cpac_year = year - 1;
+    data = fetch_ratings(state, cpac_year)
+    add_cpac_people(state, cpac_year, data, house_or_senate)
 
     print("Creating spreadsheet...")
     await manager.send_message("Creating spreadsheet...", websocket)
@@ -294,7 +298,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     }), websocket)
                 
                 # Clean up the file
-                os.remove(file_name)
+                # os.remove(file_name)
                 
             except Exception as e:
                 await manager.send_message(json.dumps({
@@ -305,6 +309,6 @@ async def websocket_endpoint(websocket: WebSocket):
         await manager.disconnect(websocket)
 
 if __name__ == '__main__':
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="127.0.0.1", port=5000)
 
 # %%
