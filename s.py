@@ -12,7 +12,6 @@ conn = sqlite3.connect(':memory:')
 cursor = conn.cursor()
 
 #%%
-
 api_key = "1044f606ddae7161c0dd3271961d7ffa"
 example_session_id = 2007
 example_person_name = "Terry Alexander"
@@ -41,11 +40,18 @@ def fetch_votes(roll_call_id):
     response = requests.get(url, timeout=5)
     response.raise_for_status()  # Raises an HTTPError for bad responses
     data = response.json()
-    return data['roll_call']['votes']  # fields: people_id, vote_id, vote_text
+    return data['roll_call']  # fields: people_id, vote_id, vote_text
+def fetch_bill(bill_id):
+    url = f"https://api.legiscan.com/?key={api_key}&op=getBill&id={bill_id}"
+    response = requests.get(url, timeout=5)
+    response.raise_for_status()  # Raises an HTTPError for bad responses
+    data = response.json()
+    return data['bill']
 def drop_tables():
     cursor.execute('DROP TABLE IF EXISTS session_people')
     cursor.execute('DROP TABLE IF EXISTS rollcall_votes')
     cursor.execute('DROP TABLE IF EXISTS cpac_people')
+    cursor.execute('DROP TABLE IF EXISTS bills')
 def create_tables():
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS session_people (
@@ -63,6 +69,7 @@ def create_tables():
         people_id INTEGER,
         vote_id INTEGER,
         vote_text TEXT,
+        bill_id INTEGER,
         FOREIGN KEY (people_id) REFERENCES session_people(people_id)
     )''')
     cursor.execute('''
@@ -74,6 +81,17 @@ def create_tables():
         years_of_service INTEGER,
         state TEXT, 
         year INTEGER           
+    )''')
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS bills (
+        bill_id INTEGER PRIMARY KEY,
+        bill_number TEXT,
+        title TEXT,
+        state TEXT,
+        description TEXT,
+        approved BOOL,
+        approved_text TEXT,
+        link TEXT
     )''')
 def add_session_people(state, people_data, house_or_senate):    
     for p in people_data:
@@ -89,12 +107,13 @@ def add_session_people(state, people_data, house_or_senate):
         INSERT OR IGNORE INTO session_people (state, people_id, name, last_name, role, party)
         VALUES (?, ?, ?, ?, ?, ?)
         ''', (state, p['people_id'], p['name'], p['last_name'], p['role'], p['party']))
-def add_rollcall_votes(rollcall_id, votes_data):
-    for v in votes_data:
+def add_rollcall_votes(rollcall_id, rollcall_data):
+    bill_id = rollcall_data['bill_id']
+    for v in rollcall_data['votes']:
         cursor.execute('''
-        INSERT OR IGNORE INTO rollcall_votes (rollcall_id, people_id, vote_id, vote_text)
-        VALUES (?, ?, ?, ?)
-        ''', (rollcall_id, v['people_id'], v['vote_id'], v['vote_text']))
+        INSERT OR IGNORE INTO rollcall_votes (rollcall_id, people_id, vote_id, vote_text, bill_id)
+        VALUES (?, ?, ?, ?, ?)
+        ''', (rollcall_id, v['people_id'], v['vote_id'], v['vote_text'], bill_id))
 def add_cpac_people(state, year, cpac_people_data, house_or_senate):
     for c in cpac_people_data:
         name=c['name']
@@ -112,6 +131,18 @@ def add_cpac_people(state, year, cpac_people_data, house_or_senate):
         INSERT OR IGNORE INTO cpac_people (name, party, previous_year_score, old_lifetime_score, years_of_service, state, year)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (name, party, previous_year_score, old_lifetime_score, years_of_service, state, year))                                             
+def add_bill(bill_id, bill_data):
+    link = bill_data['url']
+    bill_number = bill_data['bill_number']
+    title = bill_data['title']
+    state = bill_data['state']
+    actions = [h['action'] for h in bill_data['history']]
+    approved = any('approved' in a.lower() for a in actions)
+    description = bill_data['description']
+    cursor.execute('''
+    INSERT OR IGNORE INTO bills (bill_id, bill_number, title, state, description, approved, link)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (bill_id, bill_number, title, state, description, approved, link))
 def create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year):
     # Initialize empty DataFrame with names
     query = """
@@ -138,7 +169,12 @@ def create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year):
     # Add each bill's votes as a new column
     for i, rollcall_id in enumerate(good_rollcall_ids + bad_rollcall_ids):
         query = """
-        SELECT sp.name, rv.vote_text 
+        SELECT b.bill_number FROM rollcall_votes rv JOIN bills b ON rv.bill_id = b.bill_id WHERE rv.rollcall_id = ?
+        """
+        result = cursor.execute(query, [rollcall_id]).fetchone()
+        bill_number = result[0] if result else f'Bill{i+1}'
+        query = """
+        SELECT sp.name, rv.vote_text
         FROM session_people sp
         JOIN rollcall_votes rv 
             ON sp.people_id = rv.people_id
@@ -146,15 +182,38 @@ def create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year):
             AND rv.rollcall_id = ?
         """
         cursor.execute(query, [state, rollcall_id])
-        votes = pd.DataFrame(cursor.fetchall(), columns=['Name', f'Bill{i+1}'])
-        df = df.merge(votes[['Name', f'Bill{i+1}']], on='Name', how='left')
+        votes = pd.DataFrame(cursor.fetchall(), columns=['Name', bill_number])
+        df = df.merge(votes[['Name', bill_number]], on='Name', how='left')
         # Add score column based on vote text
         vote_text_map = {'Yea': '+', 'Nay': '-', 'NV': 'x'} if rollcall_id in good_rollcall_ids else {'Yea': '-', 'Nay': '+', 'NV': 'x'}
-        df[f'Bill{i+1}'] = df[f'Bill{i+1}'].map(vote_text_map)
+        df[bill_number] = df[bill_number].map(vote_text_map)
+
+    # Add bills
+    query = """
+    SELECT bill_id, bill_number, title, state, description, approved, link
+    FROM bills
+    """
+    cursor.execute(query)
+    bills_df = pd.DataFrame(cursor.fetchall(), columns=['bill_id', 'bill_number', 'title', 'state', 'description', 'approved', 'link'])
+    # add a column for the number of yeas and nays
+    query = """
+    SELECT bill_id,
+        SUM(CASE WHEN vote_text = 'Yea' THEN 1 ELSE 0 END) AS yeas,
+        SUM(CASE WHEN vote_text = 'Nay' THEN 1 ELSE 0 END) AS nays
+    FROM rollcall_votes
+    GROUP BY bill_id
+    """
+    cursor.execute(query)
+    yeas_nays_df = pd.DataFrame(cursor.fetchall(), columns=['bill_id', 'yeas', 'nays'])
+    bills_df = pd.merge(bills_df, yeas_nays_df, on='bill_id', how='left')
+    # Add a column showing if bill passed and vote counts
+    bills_df['passed'] = bills_df.apply(lambda row: f'The bill {"passed" if row["yeas"] > row["nays"] else "failed"} with a vote of {row["yeas"]} yeas and {row["nays"]} nays', axis=1)
 
     # Write to Excel
     file_name = f'votes_{state}_{year}.xlsx'
-    df.to_excel(file_name, index=False)
+    with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Votes', index=False)
+        bills_df.to_excel(writer, sheet_name='Bills', index=False)
     return file_name
 
 
@@ -185,7 +244,8 @@ async def process(state: str, year: str, chamber: str, good_rollcalls: str, bad_
     #     session_entry.delete(0, tk.END)
     #     session_entry.insert(0, default_session_entry_msg)
     #     return
-    await manager.send_message("Processing...", websocket)
+    if manager:
+        await manager.send_message("Processing...", websocket)
     good_rollcall_ids = validate_rollcalls(good_rollcalls)
     bad_rollcall_ids = validate_rollcalls(bad_rollcalls)
     year = validate_year(year)
@@ -198,27 +258,43 @@ async def process(state: str, year: str, chamber: str, good_rollcalls: str, bad_
         session_people = fetch_people(session_id)
         house_or_senate = "senate" if house_or_senate_flag==0 else "house"
         add_session_people(state, session_people, house_or_senate)
-        await manager.send_message(f"Processed session {session_id}", websocket)
+        if manager:
+            await manager.send_message(f"Processed session {session_id}", websocket)
 
     for rid in good_rollcall_ids+bad_rollcall_ids:
-        await manager.send_message(f"Processing roll call {rid}...", websocket)
+        if manager:
+            await manager.send_message(f"Processing roll call {rid}...", websocket)
         print(f"Fetching votes for roll call {rid}...")
-        votes = fetch_votes(rid)
-        add_rollcall_votes(rid, votes)
+        rollcall_data = fetch_votes(rid)
+        add_rollcall_votes(rid, rollcall_data)
+        if manager:
+            await manager.send_message(f"Processed roll call {rid}...", websocket)
+        print(f"Fetching bill {rid}...")
+        bill_id = rollcall_data['bill_id']
+        bill_data = fetch_bill(bill_id)
+        add_bill(bill_id, bill_data)
 
     print("Fetching CPAC (acu) Ratings...")
-    await manager.send_message("Fetching CPAC (acu) Ratings...", websocket)
+    if manager:
+        await manager.send_message("Fetching CPAC (acu) Ratings...", websocket)
     cpac_year = year - 1;
     data = fetch_ratings(state, cpac_year)
     add_cpac_people(state, cpac_year, data, house_or_senate)
 
     print("Creating spreadsheet...")
-    await manager.send_message("Creating spreadsheet...", websocket)
+    if manager:
+        await manager.send_message("Creating spreadsheet...", websocket)
     file_name = create_spreadsheet(good_rollcall_ids, bad_rollcall_ids, state, year)
     print("Spreadsheet created!")
-    await manager.send_message("Spreadsheet created!", websocket)
+    if manager:
+        await manager.send_message("Spreadsheet created!", websocket)
     return file_name
 
+#%%
+import nest_asyncio
+nest_asyncio.apply()
+import asyncio
+asyncio.run(process("AZ", "2024", "senate", "1437226", "1423115", None, None))
 
 #%%
 import nest_asyncio
